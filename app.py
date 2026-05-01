@@ -1,22 +1,19 @@
 """
-Streamlit dashboard - Cloud versie.
-Haalt data direct op via yfinance met caching (24 uur).
-Geen lokale database nodig.
+Streamlit dashboard - leest uit parquet-bestanden.
+Geen yfinance call, geen rate limits, razendsnel.
 
-Run lokaal met: streamlit run app.py
-Of deploy via Streamlit Community Cloud.
+Run lokaal:    streamlit run app.py
+Deploy:        push naar GitHub, Streamlit Cloud doet de rest
 """
 
 import streamlit as st
 import pandas as pd
-import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import analysis
-from tickers import ALL_TICKERS, get_market
-
 
 # Pagina-configuratie
 st.set_page_config(
@@ -26,79 +23,104 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-
-# === Data ophalen met cache ===
-# 24 uur cache - data wordt 1x per dag ververst per ticker
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_stock_data(ticker, period="20y"):
-    """
-    Haalt koersdata op via yfinance.
-    Gecached voor 24 uur per ticker.
-    """
-    try:
-        stock = yf.Ticker(ticker)
-        prices = stock.history(period=period, auto_adjust=False)
-
-        if prices.empty:
-            return None
-
-        # Tijdzone weghalen voor consistentie
-        if prices.index.tz is not None:
-            prices.index = prices.index.tz_localize(None)
-
-        # Dividenden en splits ophalen
-        actions = stock.actions if hasattr(stock, 'actions') else pd.DataFrame()
-        dividends = pd.Series(dtype=float)
-        splits = pd.Series(dtype=float)
-
-        if not actions.empty:
-            if actions.index.tz is not None:
-                actions.index = actions.index.tz_localize(None)
-            if "Dividends" in actions.columns:
-                dividends = actions["Dividends"][actions["Dividends"] > 0]
-            if "Stock Splits" in actions.columns:
-                splits = actions["Stock Splits"][actions["Stock Splits"] > 0]
-
-        # Bedrijfsinfo
-        info = {}
-        try:
-            raw_info = stock.info
-            info = {
-                "sector": raw_info.get("sector"),
-                "industry": raw_info.get("industry"),
-                "currency": raw_info.get("currency", "USD"),
-            }
-        except Exception:
-            pass
-
-        return {
-            "prices": prices,
-            "dividends": dividends,
-            "splits": splits,
-            "info": info,
-        }
-    except Exception as e:
-        st.error(f"Fout bij ophalen {ticker}: {e}")
-        return None
+DATA_DIR = Path(__file__).parent / "data"
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_multiple_stocks(tickers_tuple):
-    """Haalt meerdere stocks tegelijk op (voor vergelijkings-pagina)."""
-    results = {}
-    for ticker in tickers_tuple:
-        data = fetch_stock_data(ticker)
-        if data is not None:
-            results[ticker] = data
-    return results
+# === Data laden met cache ===
+
+@st.cache_data
+def load_stocks():
+    """Laadt aandelen-metadata."""
+    path = DATA_DIR / "stocks.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(path)
+
+
+@st.cache_data
+def load_all_prices():
+    """Laadt alle koersen in één keer."""
+    path = DATA_DIR / "prices.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+@st.cache_data
+def load_all_dividends():
+    path = DATA_DIR / "dividends.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+@st.cache_data
+def load_all_splits():
+    path = DATA_DIR / "splits.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+@st.cache_data
+def get_last_update():
+    path = DATA_DIR / "last_update.txt"
+    if path.exists():
+        return path.read_text().strip()
+    return "onbekend"
+
+
+def get_prices_for_ticker(ticker, start_date=None, end_date=None):
+    """Filter koersen voor één ticker."""
+    df = load_all_prices()
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df[df["ticker"] == ticker].copy()
+    df.set_index("date", inplace=True)
+    df.sort_index(inplace=True)
+
+    if start_date:
+        df = df[df.index >= pd.to_datetime(start_date)]
+    if end_date:
+        df = df[df.index <= pd.to_datetime(end_date)]
+
+    return df
+
+
+def get_dividends_for_ticker(ticker):
+    df = load_all_dividends()
+    if df.empty:
+        return pd.DataFrame()
+    return df[df["ticker"] == ticker].sort_values("date")
+
+
+def get_splits_for_ticker(ticker):
+    df = load_all_splits()
+    if df.empty:
+        return pd.DataFrame()
+    return df[df["ticker"] == ticker].sort_values("date")
 
 
 def get_currency_symbol(ticker):
-    """Bepaalt valutasymbool op basis van markt."""
     if ticker.endswith((".AS", ".DE", ".PA")):
         return "€"
     return "$"
+
+
+def check_data_available():
+    """Controleert of de data beschikbaar is."""
+    required = ["stocks.parquet", "prices.parquet"]
+    missing = [f for f in required if not (DATA_DIR / f).exists()]
+    return len(missing) == 0, missing
 
 
 # === Pagina's ===
@@ -106,8 +128,15 @@ def get_currency_symbol(ticker):
 def page_single_stock():
     st.title("📈 Aandelen-analyse")
 
-    options = {f"{name} ({ticker}) - {get_market(ticker)}": ticker
-               for ticker, name in ALL_TICKERS.items()}
+    stocks_df = load_stocks()
+    if stocks_df.empty:
+        st.error("Geen data beschikbaar. Run eerst lokaal: `python data_pipeline.py`")
+        return
+
+    options = {}
+    for _, row in stocks_df.iterrows():
+        label = f"{row['company_name']} ({row['ticker']}) - {row['market']}"
+        options[label] = row['ticker']
 
     with st.sidebar:
         st.header("⚙️ Instellingen")
@@ -118,17 +147,18 @@ def page_single_stock():
         selected_ticker = options[selected_label]
 
         period_options = {
-            "1 jaar": "1y",
-            "3 jaar": "3y",
-            "5 jaar": "5y",
-            "10 jaar": "10y",
-            "20 jaar (max)": "max",
+            "1 jaar": 365,
+            "3 jaar": 365 * 3,
+            "5 jaar": 365 * 5,
+            "10 jaar": 365 * 10,
+            "20 jaar (alles)": 365 * 25,
         }
         selected_period = st.selectbox(
             "Periode",
             options=list(period_options.keys()),
             index=4,
         )
+        days_back = period_options[selected_period]
 
         st.divider()
         show_volume = st.checkbox("Toon volume", value=True)
@@ -137,23 +167,28 @@ def page_single_stock():
         log_scale = st.checkbox("Log-schaal (aanbevolen voor lange periodes)", value=False)
 
     # Data ophalen
-    with st.spinner(f"📡 Data ophalen voor {selected_ticker}..."):
-        data = fetch_stock_data(selected_ticker, period=period_options[selected_period])
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days_back)
 
-    if data is None or data["prices"].empty:
+    prices_df = get_prices_for_ticker(
+        selected_ticker,
+        start_date.strftime("%Y-%m-%d"),
+        end_date.strftime("%Y-%m-%d"),
+    )
+
+    if prices_df.empty:
         st.error(f"Geen data gevonden voor {selected_ticker}")
         return
 
-    prices_df = data["prices"]
+    # Stock info
+    stock_info = stocks_df[stocks_df["ticker"] == selected_ticker].iloc[0]
     currency = get_currency_symbol(selected_ticker)
-    company_name = ALL_TICKERS[selected_ticker]
 
-    # Header
-    st.subheader(f"{company_name} ({selected_ticker})")
+    st.subheader(f"{stock_info['company_name']} ({selected_ticker})")
     info_parts = []
-    if data["info"].get("sector"):
-        info_parts.append(f"Sector: {data['info']['sector']}")
-    info_parts.append(f"Markt: {get_market(selected_ticker)}")
+    if pd.notna(stock_info.get('sector')):
+        info_parts.append(f"Sector: {stock_info['sector']}")
+    info_parts.append(f"Markt: {stock_info['market']}")
     st.caption(" • ".join(info_parts))
 
     # Metrics
@@ -168,18 +203,17 @@ def page_single_stock():
                   help="Totaal rendement over de geselecteerde periode")
     with col2:
         st.metric("Geann. rendement (CAGR)", f"{metrics['annualized_return_pct']:.2f}%",
-                  help="Compound Annual Growth Rate - jaarlijks gemiddeld rendement")
+                  help="Compound Annual Growth Rate")
     with col3:
         st.metric("Volatiliteit (jaar)", f"{metrics['annualized_volatility_pct']:.1f}%",
-                  help="Geannualiseerde standaarddeviatie. Hoger = grilliger.")
+                  help="Geannualiseerde standaarddeviatie")
     with col4:
         st.metric("Max drawdown", f"{metrics['max_drawdown_pct']:.1f}%",
-                  help=f"Grootste piek-tot-dal daling. Van {metrics['max_drawdown_peak']} tot {metrics['max_drawdown_trough']}.")
+                  help=f"Van {metrics['max_drawdown_peak']} tot {metrics['max_drawdown_trough']}")
 
     col5, col6, col7, col8 = st.columns(4)
     with col5:
-        st.metric("Sharpe ratio", f"{metrics['sharpe_ratio']:.2f}",
-                  help=">1 is goed, >2 zeer goed")
+        st.metric("Sharpe ratio", f"{metrics['sharpe_ratio']:.2f}", help=">1 is goed")
     with col6:
         st.metric("Startprijs", f"{currency}{metrics['start_price']:.2f}")
     with col7:
@@ -201,7 +235,7 @@ def page_single_stock():
 
     fig.add_trace(
         go.Scatter(
-            x=prices_df.index, y=prices_df["Close"],
+            x=prices_df.index, y=prices_df["close"],
             mode="lines", name="Koers",
             line=dict(color="#1f77b4", width=2),
             hovertemplate=f"<b>%{{x|%Y-%m-%d}}</b><br>{currency}%{{y:.2f}}<extra></extra>",
@@ -209,50 +243,52 @@ def page_single_stock():
     )
 
     # Dividenden
-    if show_dividends and not data["dividends"].empty:
-        divs = data["dividends"]
-        divs_in_range = divs[
-            (divs.index >= prices_df.index.min()) &
-            (divs.index <= prices_df.index.max())
-        ]
-        if not divs_in_range.empty:
-            div_prices = []
-            for d in divs_in_range.index:
-                closest = prices_df.index[prices_df.index <= d]
-                if len(closest) > 0:
-                    div_prices.append(prices_df.loc[closest[-1], "Close"])
-                else:
-                    div_prices.append(None)
+    if show_dividends:
+        divs = get_dividends_for_ticker(selected_ticker)
+        if not divs.empty:
+            divs_in_range = divs[
+                (divs["date"] >= prices_df.index.min()) &
+                (divs["date"] <= prices_df.index.max())
+            ]
+            if not divs_in_range.empty:
+                div_prices = []
+                for d in divs_in_range["date"]:
+                    closest = prices_df.index[prices_df.index <= d]
+                    if len(closest) > 0:
+                        div_prices.append(prices_df.loc[closest[-1], "close"])
+                    else:
+                        div_prices.append(None)
 
-            fig.add_trace(
-                go.Scatter(
-                    x=divs_in_range.index, y=div_prices,
-                    mode="markers", name="Dividend",
-                    marker=dict(symbol="diamond", size=8, color="green"),
-                    hovertemplate=f"<b>Dividend</b><br>%{{x|%Y-%m-%d}}<br>{currency}%{{customdata:.3f}}<extra></extra>",
-                    customdata=divs_in_range.values,
-                ), row=1, col=1,
-            )
+                fig.add_trace(
+                    go.Scatter(
+                        x=divs_in_range["date"], y=div_prices,
+                        mode="markers", name="Dividend",
+                        marker=dict(symbol="diamond", size=8, color="green"),
+                        hovertemplate=f"<b>Dividend</b><br>%{{x|%Y-%m-%d}}<br>{currency}%{{customdata:.3f}}<extra></extra>",
+                        customdata=divs_in_range["amount"],
+                    ), row=1, col=1,
+                )
 
     # Splits
-    if show_splits and not data["splits"].empty:
-        splits = data["splits"]
-        splits_in_range = splits[
-            (splits.index >= prices_df.index.min()) &
-            (splits.index <= prices_df.index.max())
-        ]
-        for date, ratio in splits_in_range.items():
-            fig.add_vline(
-                x=date, line_dash="dash", line_color="orange",
-                annotation_text=f"Split {ratio:.0f}:1",
-                annotation_position="top", row=1, col=1,
-            )
+    if show_splits:
+        splits = get_splits_for_ticker(selected_ticker)
+        if not splits.empty:
+            splits_in_range = splits[
+                (splits["date"] >= prices_df.index.min()) &
+                (splits["date"] <= prices_df.index.max())
+            ]
+            for _, row in splits_in_range.iterrows():
+                fig.add_vline(
+                    x=row["date"], line_dash="dash", line_color="orange",
+                    annotation_text=f"Split {row['ratio']:.0f}:1",
+                    annotation_position="top", row=1, col=1,
+                )
 
     # Volume
     if show_volume:
         fig.add_trace(
             go.Bar(
-                x=prices_df.index, y=prices_df["Volume"],
+                x=prices_df.index, y=prices_df["volume"],
                 name="Volume", marker=dict(color="#888", opacity=0.5),
                 hovertemplate="<b>%{x|%Y-%m-%d}</b><br>%{y:,.0f}<extra></extra>",
             ), row=2, col=1,
@@ -289,7 +325,7 @@ def page_single_stock():
         )
         st.plotly_chart(bar_fig, use_container_width=True)
 
-    # Rolling volatility
+    # Rolling vol
     with st.expander("📉 Geavanceerd: rolling volatiliteit (30 dagen)"):
         rv = analysis.rolling_volatility(prices_df, window=30)
         rv_fig = go.Figure(go.Scatter(
@@ -302,13 +338,21 @@ def page_single_stock():
             margin=dict(t=20, b=20, l=20, r=20),
         )
         st.plotly_chart(rv_fig, use_container_width=True)
-        st.caption("Pieken in deze grafiek tonen marktstress (bv. 2008, 2020).")
+        st.caption("Pieken tonen marktstress (bv. 2008, 2020).")
 
 
 def page_compare():
     st.title("⚖️ Aandelen vergelijken")
 
-    options = {f"{name} ({ticker})": ticker for ticker, name in ALL_TICKERS.items()}
+    stocks_df = load_stocks()
+    if stocks_df.empty:
+        st.error("Geen data beschikbaar. Run eerst lokaal: `python data_pipeline.py`")
+        return
+
+    options = {}
+    for _, row in stocks_df.iterrows():
+        label = f"{row['company_name']} ({row['ticker']})"
+        options[label] = row['ticker']
 
     with st.sidebar:
         st.header("⚙️ Vergelijking")
@@ -320,21 +364,20 @@ def page_compare():
         )
 
         period_options = {
-            "1 jaar": "1y", "3 jaar": "3y", "5 jaar": "5y",
-            "10 jaar": "10y", "20 jaar": "max",
+            "1 jaar": 365, "3 jaar": 365 * 3, "5 jaar": 365 * 5,
+            "10 jaar": 365 * 10, "20 jaar": 365 * 25,
         }
         selected_period = st.selectbox(
             "Periode", options=list(period_options.keys()), index=2,
         )
+        days_back = period_options[selected_period]
 
     if not selected_labels:
         st.info("Selecteer minimaal één aandeel in de zijbalk.")
         return
 
-    selected_tickers = tuple(sorted([options[l] for l in selected_labels]))
-
-    with st.spinner(f"📡 Data ophalen voor {len(selected_tickers)} aandelen..."):
-        all_data = fetch_multiple_stocks(selected_tickers)
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days_back)
 
     fig = go.Figure()
     metrics_rows = []
@@ -342,11 +385,14 @@ def page_compare():
 
     for i, label in enumerate(selected_labels):
         ticker = options[label]
-        data = all_data.get(ticker)
-        if data is None or data["prices"].empty:
+        prices_df = get_prices_for_ticker(
+            ticker,
+            start_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d"),
+        )
+        if prices_df.empty:
             continue
 
-        prices_df = data["prices"]
         normalized = analysis.normalize_for_comparison(prices_df, base=100)
 
         fig.add_trace(go.Scatter(
@@ -381,44 +427,57 @@ def page_compare():
 def page_info():
     st.title("ℹ️ Over deze app")
 
-    st.markdown(f"""
-    ### 📈 Stock Analyzer — MVP Fase 1
+    last_update = get_last_update()
+    stocks_df = load_stocks()
+    prices_df = load_all_prices()
 
-    **Aantal aandelen:** {len(ALL_TICKERS)}
-    **Bron:** Yahoo Finance (via yfinance)
-    **Cache:** Data wordt 24 uur gecached per aandeel
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Aandelen", len(stocks_df))
+    with col2:
+        st.metric("Koersregels", f"{len(prices_df):,}")
+    with col3:
+        if not prices_df.empty:
+            date_min = prices_df["date"].min().strftime("%Y")
+            date_max = prices_df["date"].max().strftime("%Y")
+            st.metric("Periode", f"{date_min} – {date_max}")
 
-    ### Wat zit erin
+    st.info(f"📅 Data laatst bijgewerkt: **{last_update}**")
 
-    - **Enkel aandeel:** koersgrafiek over max 20 jaar, met dividenden en aandelensplitsingen op de tijdlijn
-    - **Vergelijken:** tot 5 aandelen genormaliseerd naast elkaar
-    - **Metrics:** rendement, volatiliteit, max drawdown, Sharpe ratio, jaarrendementen
+    st.markdown("""
+    ### Hoe werkt deze app?
+
+    Data wordt **lokaal opgehaald** (via `data_pipeline.py`) en als parquet-bestanden
+    naar GitHub gepusht. De Streamlit-app leest die bestanden en toont alles instant —
+    geen rate limits, geen wachten.
 
     ### Volgende stappen
 
-    - **Fase 2:** events koppelen (kwartaalcijfers, fusies, regulering)
-    - **Fase 3:** patroonherkenning - "wat doet aandeel X gemiddeld na event Y?"
+    - **Fase 2:** events koppelen (kwartaalcijfers, fusies)
+    - **Fase 3:** patroonherkenning en analyse
 
     ### ⚠️ Disclaimer
 
     Dit is een leertool. Niets in deze app is beleggingsadvies.
-    Historische koersen voorspellen geen toekomstige resultaten.
     """)
 
-    with st.expander("📋 Volledige aandelenlijst"):
-        df = pd.DataFrame([
-            {"Ticker": t, "Bedrijf": n, "Markt": get_market(t)}
-            for t, n in ALL_TICKERS.items()
-        ])
-        st.dataframe(df, use_container_width=True, hide_index=True)
+    if not stocks_df.empty:
+        with st.expander(f"📋 Volledige aandelenlijst ({len(stocks_df)})"):
+            st.dataframe(
+                stocks_df[["ticker", "company_name", "market", "sector"]],
+                use_container_width=True, hide_index=True,
+            )
 
 
 # === Hoofdnavigatie ===
 
 def main():
+    # Check data
+    available, missing = check_data_available()
+
     with st.sidebar:
         st.title("📈 Stock Analyzer")
-        st.caption("MVP – fase 1")
+        st.caption(f"MVP fase 1 • Update: {get_last_update()[:10] if get_last_update() != 'onbekend' else 'geen data'}")
 
         page = st.radio(
             "Navigatie",
@@ -426,6 +485,21 @@ def main():
             label_visibility="collapsed",
         )
         st.divider()
+
+    if not available:
+        st.error(f"⚠️ Data ontbreekt: {', '.join(missing)}")
+        st.markdown("""
+        **Eerste keer gebruiken?** Run lokaal:
+        ```bash
+        pip install -r requirements.txt
+        python data_pipeline.py
+        git add data/
+        git commit -m "Initial data"
+        git push
+        ```
+        Daarna ververst de online app vanzelf binnen ~1 minuut.
+        """)
+        return
 
     if page == "📊 Enkel aandeel":
         page_single_stock()

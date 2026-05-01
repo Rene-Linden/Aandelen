@@ -6,6 +6,16 @@ import numpy as np
 import pandas as pd
 
 
+def _get_price_series(prices_df):
+    """Haalt prijsserie op uit DataFrame, ongeacht kolom-casing."""
+    for col in ["close", "Close", "adj_close", "Adj Close"]:
+        if col in prices_df.columns:
+            series = prices_df[col].dropna()
+            if not series.empty:
+                return series
+    return pd.Series(dtype=float)
+
+
 def calculate_returns(prices, period="daily"):
     if period == "daily":
         return prices.pct_change().dropna()
@@ -63,14 +73,7 @@ def sharpe_ratio(prices, risk_free_rate=0.02):
 
 
 def calculate_all_metrics(prices_df):
-    """prices_df: DataFrame met 'Close' kolom (yfinance-style)."""
-    if "Close" in prices_df.columns:
-        prices = prices_df["Close"].dropna()
-    elif "close" in prices_df.columns:
-        prices = prices_df["close"].dropna()
-    else:
-        return {}
-
+    prices = _get_price_series(prices_df)
     if len(prices) < 2:
         return {}
 
@@ -93,13 +96,9 @@ def calculate_all_metrics(prices_df):
 
 
 def yearly_returns(prices_df):
-    if "Close" in prices_df.columns:
-        prices = prices_df["Close"].dropna()
-    elif "close" in prices_df.columns:
-        prices = prices_df["close"].dropna()
-    else:
+    prices = _get_price_series(prices_df)
+    if prices.empty:
         return pd.Series(dtype=float)
-
     yearly = prices.resample("YE").last()
     returns = yearly.pct_change() * 100
     returns.index = returns.index.year
@@ -107,23 +106,15 @@ def yearly_returns(prices_df):
 
 
 def rolling_volatility(prices_df, window=30):
-    if "Close" in prices_df.columns:
-        prices = prices_df["Close"].dropna()
-    elif "close" in prices_df.columns:
-        prices = prices_df["close"].dropna()
-    else:
+    prices = _get_price_series(prices_df)
+    if prices.empty:
         return pd.Series(dtype=float)
     daily_returns = prices.pct_change()
     return daily_returns.rolling(window=window).std() * np.sqrt(252) * 100
 
 
 def normalize_for_comparison(prices_df, base=100):
-    if "Close" in prices_df.columns:
-        prices = prices_df["Close"].dropna()
-    elif "close" in prices_df.columns:
-        prices = prices_df["close"].dropna()
-    else:
-        return pd.Series(dtype=float)
+    prices = _get_price_series(prices_df)
     if len(prices) == 0:
         return prices
     return (prices / prices.iloc[0]) * base

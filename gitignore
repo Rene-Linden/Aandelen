@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# NB: data/*.parquet wordt WEL gecommit - dat is precies de bedoeling!
