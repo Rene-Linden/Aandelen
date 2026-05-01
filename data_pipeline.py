@@ -2,20 +2,21 @@
 Data Pipeline - lokaal te draaien
 ==================================
 
-Haalt alle koersdata op via yfinance en slaat op als parquet bestanden:
-  - data/prices.parquet     - dagelijkse koersen (alle tickers samen)
-  - data/dividends.parquet  - dividenduitkeringen
-  - data/splits.parquet     - aandelensplitsingen
-  - data/stocks.parquet     - bedrijfsmetadata (sector, industrie)
-  - data/last_update.txt    - timestamp van laatste run
+Haalt op:
+  - Dagelijkse koersen
+  - Dividenden en aandelensplitsingen
+  - Earnings (kwartaalcijfers): verwachte vs werkelijke EPS
+
+Slaat op als parquet-bestanden in data/:
+  - prices.parquet     - dagelijkse koersen
+  - dividends.parquet  - dividenduitkeringen
+  - splits.parquet     - aandelensplitsingen
+  - stocks.parquet     - bedrijfsmetadata
+  - earnings.parquet   - kwartaalcijfers (NIEUW in fase 2)
+  - last_update.txt    - timestamp
 
 Gebruik:
     python data_pipeline.py
-
-Daarna committen naar GitHub:
-    git add data/
-    git commit -m "Update data"
-    git push
 """
 
 import time
@@ -31,14 +32,13 @@ from tickers import ALL_TICKERS, get_market
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-# Vertraging tussen requests om rate limits te voorkomen
-DELAY_BETWEEN_REQUESTS = 2.0  # seconden
+DELAY_BETWEEN_REQUESTS = 2.0
 MAX_RETRIES = 3
-RETRY_DELAY = 30  # seconden bij rate-limit
+RETRY_DELAY = 30
 
 
 def fetch_with_retry(ticker, period="20y", max_retries=MAX_RETRIES):
-    """Haalt data op met retry-logica bij rate limits."""
+    """Haalt prijs- en event-data op met retry-logica."""
     for attempt in range(max_retries):
         try:
             stock = yf.Ticker(ticker)
@@ -47,16 +47,14 @@ def fetch_with_retry(ticker, period="20y", max_retries=MAX_RETRIES):
             if prices.empty:
                 return None
 
-            # Tijdzone weghalen
             if prices.index.tz is not None:
                 prices.index = prices.index.tz_localize(None)
 
-            # Actions (dividenden, splits)
             actions = stock.actions if hasattr(stock, 'actions') else pd.DataFrame()
             if not actions.empty and actions.index.tz is not None:
                 actions.index = actions.index.tz_localize(None)
 
-            # Info (sector etc) - mag falen
+            # Bedrijfsinfo
             info = {}
             try:
                 raw_info = stock.info
@@ -67,10 +65,14 @@ def fetch_with_retry(ticker, period="20y", max_retries=MAX_RETRIES):
             except Exception:
                 pass
 
+            # NIEUW: Earnings ophalen
+            earnings_df = fetch_earnings(stock, ticker)
+
             return {
                 "prices": prices,
                 "actions": actions,
                 "info": info,
+                "earnings": earnings_df,
             }
 
         except Exception as e:
@@ -87,18 +89,96 @@ def fetch_with_retry(ticker, period="20y", max_retries=MAX_RETRIES):
     return None
 
 
+def fetch_earnings(stock, ticker):
+    """
+    Haalt earnings-historie op via yfinance.
+
+    yfinance heeft twee bronnen die we combineren:
+      - earnings_dates: datums + verwachte/werkelijke EPS (vaak ~4-8 kwartalen)
+      - quarterly_income_stmt: kwartaaldata (revenue, etc) als backup
+
+    Returns DataFrame met kolommen:
+      ticker, date, eps_estimate, eps_actual, surprise_pct, beat
+    """
+    try:
+        # Hoofdbron: earnings_dates
+        earnings_dates = stock.earnings_dates
+        if earnings_dates is None or earnings_dates.empty:
+            return pd.DataFrame()
+
+        df = earnings_dates.copy()
+
+        # Tijdzone weghalen
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+
+        # Reset index zodat datum een kolom wordt
+        df = df.reset_index()
+        df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+
+        # Kolomnamen normaliseren - yfinance gebruikt verschillende namen
+        rename_map = {
+            "Earnings Date": "date",
+            "EPS Estimate": "eps_estimate",
+            "Reported EPS": "eps_actual",
+            "Surprise(%)": "surprise_pct",
+        }
+        df = df.rename(columns=rename_map)
+
+        # Zorg dat alle vereiste kolommen bestaan
+        for col in ["date", "eps_estimate", "eps_actual", "surprise_pct"]:
+            if col not in df.columns:
+                df[col] = None
+
+        # Alleen earnings die al PLAATSGEVONDEN hebben (niet toekomstige)
+        df = df[df["eps_actual"].notna()].copy()
+
+        if df.empty:
+            return pd.DataFrame()
+
+        # Beat/miss bepalen op basis van surprise
+        # Beat = werkelijk > verwacht, Miss = werkelijk < verwacht
+        def classify(row):
+            est = row["eps_estimate"]
+            act = row["eps_actual"]
+            if pd.isna(est) or pd.isna(act):
+                return None
+            if act > est:
+                return "beat"
+            elif act < est:
+                return "miss"
+            else:
+                return "inline"
+
+        df["beat"] = df.apply(classify, axis=1)
+        df["ticker"] = ticker
+
+        # Selecteer en sorteer
+        result = df[["ticker", "date", "eps_estimate", "eps_actual", "surprise_pct", "beat"]].copy()
+        result = result.sort_values("date").reset_index(drop=True)
+
+        # Datums normaliseren naar pure datum (zonder tijd)
+        result["date"] = pd.to_datetime(result["date"]).dt.normalize()
+
+        return result
+
+    except Exception as e:
+        # Earnings-data is optioneel, fail silent
+        return pd.DataFrame()
+
+
 def main():
-    print(f"🚀 Data Pipeline gestart")
+    print(f"🚀 Data Pipeline gestart (Fase 2 - met earnings)")
     print(f"📂 Data wordt opgeslagen in: {DATA_DIR}")
     print(f"📊 Aantal tickers: {len(ALL_TICKERS)}")
     print(f"⏱️  Geschatte tijd: ~{len(ALL_TICKERS) * (DELAY_BETWEEN_REQUESTS + 1) / 60:.1f} minuten\n")
     print("=" * 60)
 
-    # Verzamel alle data in lijsten, combineer aan het eind
     all_prices = []
     all_dividends = []
     all_splits = []
     all_stocks = []
+    all_earnings = []
 
     success = 0
     failed = []
@@ -123,18 +203,17 @@ def main():
             "industry": data["info"].get("industry"),
         })
 
-        # Prijzen - voeg ticker-kolom toe
+        # Prijzen
         prices = data["prices"].copy()
         prices["ticker"] = ticker
         prices.reset_index(inplace=True)
         prices.rename(columns={"Date": "date"}, inplace=True)
         all_prices.append(prices)
 
-        # Dividenden en splits uit actions
+        # Dividenden en splits
         actions = data["actions"]
         n_div = 0
         n_split = 0
-
         if not actions.empty:
             if "Dividends" in actions.columns:
                 divs = actions[actions["Dividends"] > 0]["Dividends"]
@@ -146,7 +225,6 @@ def main():
                     })
                     all_dividends.append(div_df)
                     n_div = len(divs)
-
             if "Stock Splits" in actions.columns:
                 splits = actions[actions["Stock Splits"] > 0]["Stock Splits"]
                 if not splits.empty:
@@ -158,20 +236,25 @@ def main():
                     all_splits.append(split_df)
                     n_split = len(splits)
 
-        print(f"✅ {len(prices)} dagen, {n_div} div, {n_split} splits")
+        # NIEUW: Earnings
+        earnings = data["earnings"]
+        n_earnings = 0
+        if earnings is not None and not earnings.empty:
+            all_earnings.append(earnings)
+            n_earnings = len(earnings)
+
+        print(f"✅ {len(prices)} dagen, {n_div} div, {n_split} splits, {n_earnings} earnings")
         success += 1
 
-        # Pauze tussen requests
         if i < len(ALL_TICKERS):
             time.sleep(DELAY_BETWEEN_REQUESTS)
 
-    # === Alles opslaan als parquet ===
+    # === Opslaan ===
     print("\n" + "=" * 60)
     print("💾 Opslaan...")
 
     if all_prices:
         prices_df = pd.concat(all_prices, ignore_index=True)
-        # Compactere kolomnamen
         prices_df.columns = [c.lower().replace(" ", "_") for c in prices_df.columns]
         prices_df.to_parquet(DATA_DIR / "prices.parquet", index=False)
         print(f"  ✓ prices.parquet ({len(prices_df):,} rijen)")
@@ -181,10 +264,8 @@ def main():
         dividends_df.to_parquet(DATA_DIR / "dividends.parquet", index=False)
         print(f"  ✓ dividends.parquet ({len(dividends_df)} rijen)")
     else:
-        # Lege placeholder
         pd.DataFrame(columns=["ticker", "date", "amount"]).to_parquet(
-            DATA_DIR / "dividends.parquet", index=False
-        )
+            DATA_DIR / "dividends.parquet", index=False)
 
     if all_splits:
         splits_df = pd.concat(all_splits, ignore_index=True)
@@ -192,26 +273,38 @@ def main():
         print(f"  ✓ splits.parquet ({len(splits_df)} rijen)")
     else:
         pd.DataFrame(columns=["ticker", "date", "ratio"]).to_parquet(
-            DATA_DIR / "splits.parquet", index=False
-        )
+            DATA_DIR / "splits.parquet", index=False)
+
+    # NIEUW: earnings opslaan
+    if all_earnings:
+        earnings_df = pd.concat(all_earnings, ignore_index=True)
+        earnings_df.to_parquet(DATA_DIR / "earnings.parquet", index=False)
+        print(f"  ✓ earnings.parquet ({len(earnings_df)} rijen)")
+    else:
+        pd.DataFrame(columns=["ticker", "date", "eps_estimate", "eps_actual",
+                              "surprise_pct", "beat"]).to_parquet(
+            DATA_DIR / "earnings.parquet", index=False)
+        print(f"  ⚠ earnings.parquet (leeg - geen data beschikbaar)")
 
     stocks_df = pd.DataFrame(all_stocks)
     stocks_df.to_parquet(DATA_DIR / "stocks.parquet", index=False)
     print(f"  ✓ stocks.parquet ({len(stocks_df)} rijen)")
 
-    # Timestamp van update
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     (DATA_DIR / "last_update.txt").write_text(timestamp)
     print(f"  ✓ last_update.txt ({timestamp})")
 
-    # === Samenvatting ===
+    # Samenvatting
     print("\n" + "=" * 60)
     print(f"✅ Klaar: {success}/{len(ALL_TICKERS)} succesvol")
     if failed:
         print(f"❌ Mislukt: {', '.join(failed)}")
-        print(f"\nTip: voer dit script later opnieuw uit, ontbrekende tickers worden opnieuw geprobeerd.")
 
-    # Bestandsgroottes
+    if all_earnings:
+        total_earnings = sum(len(e) for e in all_earnings)
+        tickers_with_earnings = len(all_earnings)
+        print(f"\n📊 Earnings-coverage: {tickers_with_earnings}/{success} aandelen, {total_earnings} events totaal")
+
     total_size = sum(f.stat().st_size for f in DATA_DIR.glob("*.parquet"))
     print(f"\n📦 Totale data-grootte: {total_size / 1024 / 1024:.1f} MB")
     print(f"\n💡 Volgende stap: commit en push naar GitHub")
